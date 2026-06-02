@@ -1,0 +1,32 @@
+# TEE yt-dlp Downloader — Python dependencies.
+# Installed by INSTALL.cmd into a local venv folder.
+
+# Core download engine
+yt-dlp>=2025.1
+
+# GUI
+customtkinter>=5.2
+Pillow>=11.0
+
+# Calendar widget for channel-date-range picker
+tkcalendar>=1.6
+babel>=2.18
+
+# Bundled ffmpeg binary (~30 MB) — saves the user from a separate install
+imageio-ffmpeg>=0.6
+
+# Channel-downloader fallback for Instagram / Twitter / TikTok photo carousels
+gallery-dl>=1.32
+
+# Integrated browser-login (Variante 2: persistent Chromium session)
+playwright>=1.50
+
+# TLS-impersonation so the TikTok-HD fallback hits the right backend
+curl_cffi>=0.7,<0.11
+
+# Windows toast notifications (optional but recommended)
+winotify>=1.1
+plyer>=2.1
+
+# Prozess-Baum-Check für die Zombie-Erkennung des Cookie-Browser-Subprozesses
+psutil>=5.9

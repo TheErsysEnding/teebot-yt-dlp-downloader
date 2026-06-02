@@ -1,0 +1,31 @@
+# PyInstaller build output
+build/
+dist/
+
+# Runtime binaries (too large for git — bundled in the GitHub Release ZIP)
+runtime/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Build + packaging logs
+build_log*.txt
+package_exe_log.txt
+*.NEW.zip
+*.PREV.zip
+
+# Dev / verification scripts (not for users)
+smoke_*.py
+shot_*.py
+scan_*.py
+test_*.py
+tiktok_probe.py
+gen_*.py
+tt_probe_out/
+tt_probe_out2/
+
+# Local output folders
+*.log
+.env
