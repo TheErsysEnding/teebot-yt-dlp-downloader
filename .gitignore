@@ -29,3 +29,11 @@ tt_probe_out2/
 # Local output folders
 *.log
 .env
+
+# User data — cookies, settings, browser-login profiles — NEVER commit
+data/
+
+# Dev session logs + throwaway verification scripts
+NIGHT_SESSION_*.md
+_*_test.py
+*.corrupt

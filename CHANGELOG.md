@@ -3,6 +3,55 @@
 All notable changes to the **TEE yt-dlp Downloader** are documented here.
 The project follows [Semantic Versioning](https://semver.org/).
 
+## [1.2.0] — 2026-06-05
+
+### Added
+- **Settings window (⚙)** — a dedicated button (top-right, next to theme &
+  language) opens a separate window holding Section/Trim, the filename scheme
+  (incl. ID-mode), notifications and extras. The main view now stays clean —
+  only the reset button remains at the bottom.
+- **Custom filename template `{name}`** — put your own text at any position
+  around the standard name, e.g. `TEE{name}` → `TEEMyVideo.mp4` or `{name}_yt`.
+  The extension is added automatically; with a live preview.
+- **Per-video Section/Trim** — the from/to trim no longer persists. It clears
+  after each download and on restart (with a visible hint), so it never
+  silently applies to the wrong video.
+- **Trimmed downloads kept separately** — re-downloading a video with a trim
+  now writes a distinct file (time range in the name, e.g.
+  `… [1m00s-2m00s].mp4`) and keeps the original.
+- **Windows filename-length protection** — overlong names are shortened to the
+  Windows limit (255 chars / 260 path) while keeping your custom text and the
+  extension; optionally switchable to "ask first".
+
+### Fixed
+- **Browser login no longer lost on re-open** — re-opening the integrated
+  browser used to hard-kill it, discarding a fresh TikTok/Instagram login
+  (lazily-written session). It now closes gracefully and flushes first.
+- **Channel + date filter on YouTube returned nothing** — YouTube's flat
+  enumeration has no upload date, so every item was dropped. Upload dates are
+  now back-filled per item.
+- **Rate-limit field** — non-numeric input (e.g. "5 MB") silently aborted the
+  download; it is now parsed safely.
+- **Cancel during the cookie auto-retry** — Stop now also affects the retry.
+- **"Set creation date = upload date"** — fixed unreliable behavior + a handle
+  leak on 64-bit Windows (CreateFileW handle truncation).
+- **TikTok "skip existing"** — now matches any extension (the audio/MP3 mode
+  re-downloaded every run before).
+- **Channel statistics** — skipped/existing items are no longer counted as
+  freshly downloaded.
+- **Corrupt settings.json** — is backed up as `settings.json.corrupt` and
+  logged instead of being silently overwritten with defaults.
+- **Cookie export** — HttpOnly cookies are written with the `#HttpOnly_` prefix.
+- **portable-reset** — the venv-cache skip now also recognizes
+  `.venv` / `env` / `site-packages`.
+
+### Changed
+- **Container output uses remux instead of re-encoding** — mp4/webm/mkv are
+  produced by stream-copy (fast, lossless) instead of always re-encoding.
+- **"Overwrite: number"** now honestly behaves as "skip" (yt-dlp has no native
+  conflict-numbering).
+- Window title shows **v1.2**.
+
 ## [1.1.1] — 2026-06-02
 
 ### Fixed

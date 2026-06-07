@@ -145,9 +145,10 @@ def collect_targets() -> ResetPlan:
         ))
 
     # ─── pycache (contains absolute paths to user's drive) ───
+    _venv_markers = {"venv", ".venv", "env", ".env", "virtualenv", "site-packages"}
     for cache_dir in ROOT.rglob("__pycache__"):
-        # Skip pycache inside venv — that's not personal data
-        if "venv" in cache_dir.parts:
+        # Skip pycache inside einem venv / site-packages — keine Userdaten
+        if _venv_markers & set(cache_dir.parts):
             continue
         if cache_dir.is_dir():
             size = _dir_size(cache_dir)

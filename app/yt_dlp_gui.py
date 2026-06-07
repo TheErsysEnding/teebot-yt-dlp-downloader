@@ -159,7 +159,7 @@ if _FFMPEG_RUNTIME_DIR:
 # ───────────────── Settings persistence ─────────────────
 
 APP_NAME = "teebot_yt_gui"
-GUI_VERSION = "v1.1 · 2026-05-31 (clear-history, channel-dl, tiktok-hd, 8 languages)"
+GUI_VERSION = "v1.2 · 2026-06-05 (settings window, {name} template, per-video trim, login fix, bugfixes)"
 SETTINGS_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / APP_NAME
 SETTINGS_FILE = SETTINGS_DIR / "settings.json"
 
@@ -194,6 +194,11 @@ DEFAULT_SETTINGS = {
     "fn_video_id": True,            # default an: eindeutig
     "fn_prefix": "",                # frei (z.B. "ARCHIV_")
     "fn_suffix": "",                # frei (z.B. "_backup")
+    # NEU 2026-06-05: freie Dateiname-Vorlage. {name} = Standard-Basisname
+    # (ohne Endung); User-Text frei drumherum. z.B. "TEE{name}".
+    "fn_name_template": "{name}",
+    # NEU 2026-06-05: Verhalten bei zu langem Dateinamen: "auto" | "ask"
+    "long_name_mode": "auto",
     "fn_custom_title": "",          # nur wirksam bei 1 URL
     "fn_max_title_chars": 100,      # 50-200, Pfadlimit-Schutz
     "fn_sanitize": True,            # Sonderzeichen ersetzen
@@ -285,9 +290,9 @@ DATE_FORMATS = {
 }
 
 
-def build_filename_template(opts: dict, num_urls: int = 1,
-                              kind: str = "video") -> str:
-    """Compose a yt-dlp outtmpl from the simple-mode UI options.
+def _build_base_template(opts: dict, num_urls: int = 1,
+                         kind: str = "video") -> str:
+    """Compose a yt-dlp outtmpl from the simple-mode UI options (Standardname).
 
     Two filename-styles supported via `fn_use_id_not_title`:
       A) ID-mode (default, 2026-05-24): <uploader>_<kind>_<id>.<ext>
@@ -361,6 +366,152 @@ def build_filename_template(opts: dict, num_urls: int = 1,
     return "/".join(folders + [name])
 
 
+# ─────────── {name}-Platzhalter (NEU 2026-06-05) ───────────
+
+def apply_name_template(base_tpl: str, name_template: str) -> str:
+    """Umhuellt den Standard-Basisnamen mit der User-Vorlage.
+
+    `base_tpl` = voller outtmpl '<ordner>/<basisname>.%(ext)s'. In
+    `name_template` ist {name} = Standard-Basisname (ohne Endung); User-Text
+    darf an JEDER Position stehen, die Endung bleibt erhalten.
+    Beispiel: name_template='TEE{name}' -> '<ordner>/TEE<basisname>.%(ext)s'.
+    """
+    name_template = (name_template or "{name}").strip() or "{name}"
+    if name_template == "{name}":
+        return base_tpl
+    if "{name}" not in name_template:
+        # Ohne {name} wuerde der Standardname verschwinden -> als Prefix werten
+        name_template = name_template + "{name}"
+    EXT = ".%(ext)s"
+    body, ext = ((base_tpl[:-len(EXT)], EXT) if base_tpl.endswith(EXT)
+                 else (base_tpl, ""))
+    if "/" in body:
+        folders, basename = body.rsplit("/", 1)
+        folders += "/"
+    else:
+        folders, basename = "", body
+    # Literal-% im User-Text fuer yt-dlp escapen ({name} enthaelt kein %)
+    safe = name_template.replace("%", "%%")
+    new_basename = safe.replace("{name}", basename)
+    return folders + new_basename + ext
+
+
+def build_filename_template(opts: dict, num_urls: int = 1,
+                              kind: str = "video") -> str:
+    """Standard-Template + optionale {name}-User-Vorlage (fn_name_template)."""
+    base = _build_base_template(opts, num_urls=num_urls, kind=kind)
+    return apply_name_template(base, opts.get("fn_name_template", "{name}"))
+
+
+# ─────────── Trim-Dateiname (NEU 2026-06-05) ───────────
+# Ein getrimmter Re-Download soll als SEPARATE Datei landen (Zeitspanne im
+# Namen), damit er nicht mit dem ungeschnittenen Original kollidiert und die
+# skip-Policy ihn nicht ueberspringt.
+
+def _safe_int(value, default: int = 0) -> int:
+    """int() ohne Crash bei ungueltiger Eingabe (z.B. Rate-Limit-Feld)."""
+    try:
+        return int(str(value).strip())
+    except (ValueError, TypeError):
+        return default
+
+
+def _parse_dur(s: str):
+    """'1:30'->90.0, '1:02:03'->3723.0, '90'->90.0. None bei leer/ungueltig."""
+    s = str(s).strip()
+    if not s:
+        return None
+    try:
+        if ":" in s:
+            total = 0.0
+            for p in s.split(":"):
+                total = total * 60 + float(p)
+            return total
+        return float(s)
+    except Exception:
+        return None
+
+
+def _fmt_trim_token(seconds) -> str:
+    """Sekunden -> dateinamen-sicheres Label: '1m00s' / '2h03m04s'."""
+    s = max(0, int(round(float(seconds))))
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    if h:
+        return f"{h}h{m:02d}m{sec:02d}s"
+    return f"{m}m{sec:02d}s"
+
+
+def trim_filename_suffix(trim_from: str, trim_to: str) -> str:
+    """Dateinamen-Zusatz fuer einen getrimmten Download, z.B. ' [1m00s-2m00s]'.
+
+    Leer, wenn kein/ungueltiger Trim. Offenes Ende ('to' leer) -> '...-ende'.
+    """
+    trim_from = (trim_from or "").strip()
+    trim_to = (trim_to or "").strip()
+    if not trim_from and not trim_to:
+        return ""
+    tf = _parse_dur(trim_from) or 0
+    tt = _parse_dur(trim_to)
+    if tt is not None and tt <= tf:
+        return ""  # ungueltige Spanne -> Trim wird ohnehin ignoriert
+    start = _fmt_trim_token(tf)
+    end = _fmt_trim_token(tt) if tt is not None else "ende"
+    return f" [{start}-{end}]"
+
+
+def _insert_before_ext(tpl: str, insert: str) -> str:
+    """Fuegt `insert` direkt vor das abschliessende '.%(ext)s'-Token ein."""
+    token = ".%(ext)s"
+    if tpl.endswith(token):
+        return tpl[:-len(token)] + insert + token
+    return tpl + insert
+
+
+# ─────────── Windows-Dateinamen-Längenlimit (NEU 2026-06-05) ───────────
+WIN_MAX_FILENAME = 255   # NTFS: max Zeichen pro Pfad-Komponente (Dateiname)
+WIN_MAX_PATH = 260       # klassisches MAX_PATH (ganzer Pfad)
+
+
+def _norm_ext(ext: str) -> str:
+    ext = (ext or "").strip()
+    if ext and not ext.startswith("."):
+        ext = "." + ext
+    return ext
+
+
+def windows_name_budget(out_dir, ext, max_name=WIN_MAX_FILENAME,
+                        max_path=WIN_MAX_PATH, folder_reserve=60) -> int:
+    """Max. Länge des Dateinamens (OHNE Endung), sodass sowohl der Dateiname
+    (<=255) als auch der ganze Pfad (<=260, inkl. Reserve für Unterordner)
+    sicher passen. yt-dlp's `trim_file_name` bekommt genau diesen Wert."""
+    ext = _norm_ext(ext)
+    by_name = max_name - len(ext)
+    by_path = max_path - len(str(out_dir)) - 1 - folder_reserve - len(ext)
+    return max(20, min(by_name, by_path))
+
+
+def shorten_basename(stem: str, budget: int):
+    """Kürzt den Namens-Stamm (ohne Endung) auf `budget` Zeichen.
+    Gibt (neuer_stamm, wurde_gekuerzt) zurück."""
+    if len(stem) <= budget:
+        return stem, False
+    return stem[:max(0, budget)].rstrip(), True
+
+
+def basename_exceeds_limit(name_with_ext: str, out_dir="",
+                           max_name=WIN_MAX_FILENAME,
+                           max_path=WIN_MAX_PATH) -> bool:
+    """True, wenn der Dateiname (>255) oder der ganze Pfad (>260) zu lang wäre."""
+    if len(name_with_ext) > max_name:
+        return True
+    if out_dir:
+        full = len(str(out_dir)) + 1 + len(name_with_ext)
+        if full > max_path:
+            return True
+    return False
+
+
 def render_template_preview(template: str, sample: dict) -> str:
     """Render a yt-dlp template with a sample dict for live preview.
 
@@ -413,15 +564,32 @@ def load_settings() -> dict:
         merged = dict(DEFAULT_SETTINGS)
         merged.update({k: v for k, v in data.items() if k in DEFAULT_SETTINGS})
         return merged
-    except Exception:
+    except Exception as e:
+        # Kaputte settings.json NICHT still verschlucken — sonst überschreibt der
+        # nächste save_settings die (evtl. rettbare) Datei mit Defaults und
+        # History/Settings sind endgültig weg. Defektes File beiseitelegen.
+        try:
+            bak = SETTINGS_FILE.parent / (SETTINGS_FILE.name + ".corrupt")
+            SETTINGS_FILE.replace(bak)
+            print(f"[settings] settings.json defekt ({e}) -> Backup: {bak}")
+        except Exception:
+            pass
         return dict(DEFAULT_SETTINGS)
+
+
+# Diese Keys gelten PRO VIDEO und duerfen NICHT in settings.json landen
+# (sollen nach Neustart leer sein). Zur Laufzeit liegen sie in self.settings
+# (damit der Download-Worker sie liest), werden aber beim Speichern entfernt.
+_NON_PERSISTENT_SETTINGS = {"trim_from", "trim_to"}
 
 
 def save_settings(s: dict) -> None:
     SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
     try:
+        to_save = {k: v for k, v in s.items()
+                   if k not in _NON_PERSISTENT_SETTINGS}
         with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-            json.dump(s, f, indent=2, ensure_ascii=False)
+            json.dump(to_save, f, indent=2, ensure_ascii=False)
     except Exception:
         pass
 
@@ -555,6 +723,13 @@ class YtDlpGUI(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.settings = load_settings()
+        # NEU 2026-06-05: Vars fuer das separate Einstellungs-Fenster (existieren
+        # immer, auch bevor das Fenster geoeffnet wurde)
+        self.fn_name_template_var = ctk.StringVar(
+            value=self.settings.get("fn_name_template", "{name}"))
+        self.long_name_mode_var = ctk.StringVar(
+            value=self.settings.get("long_name_mode", "auto"))
+        self._settings_win = None
         ctk.set_appearance_mode(self.settings["theme"])
         ctk.set_default_color_theme("blue")
 
@@ -758,6 +933,13 @@ class YtDlpGUI(ctk.CTk):
             command=self._toggle_theme,
         )
         self.theme_btn.pack(side="right", padx=(5, 5))
+        # NEU 2026-06-05: Einstellungen-Button oben rechts (neben Theme/Sprache)
+        self.open_settings_btn = ctk.CTkButton(
+            header, text="⚙", width=44, height=32,
+            font=ctk.CTkFont(size=16),
+            command=self._open_settings_window,
+        )
+        self.open_settings_btn.pack(side="right", padx=(5, 5))
 
         self.subtitle_lbl = ctk.CTkLabel(
             self, text="", font=ctk.CTkFont(size=12),
@@ -1157,6 +1339,9 @@ class YtDlpGUI(ctk.CTk):
 
         self._build_tab_advanced(tab_advanced)
         self._build_tab_status(tab_status)
+        # NEU 2026-06-05: Einstellungs-Fenster (versteckt) bauen — enthält
+        # Trim, Dateiname-Schema, Notifications, Extras (vorher im Advanced-Tab).
+        self._build_settings_window()
 
         # Cookies-Status initial setzen
         self._update_cookies_status()
@@ -1190,7 +1375,36 @@ class YtDlpGUI(ctk.CTk):
         return default
 
     def _build_tab_advanced(self, parent) -> None:
-        """Tab mit Section-Trim, Filename-Template, Notifications, Extras."""
+        """Unten bleibt nur der Zurücksetzen/Portable-Reset-Bereich — alle
+        übrigen Einstellungen sind ins ⚙-Einstellungs-Fenster gewandert."""
+        # ─── Zurücksetzen / Portable-Reset (Author) ───
+        reset_frame = ctk.CTkFrame(parent, border_width=2,
+                                     border_color=("#fca5a5", "#7f1d1d"))
+        reset_frame.pack(fill="x", padx=10, pady=(10, 5))
+        ctk.CTkLabel(
+            reset_frame, text="🧹  Zurücksetzen / Portable-Reset",
+            font=ctk.CTkFont(size=13, weight="bold"),
+        ).pack(anchor="w", padx=10, pady=(8, 2))
+        ctk.CTkLabel(
+            reset_frame,
+            text="Löscht ALLE Settings, URL-Historie, Browser-Logins und "
+                 "Cookies. Verwende das vor dem Weitergeben der portablen "
+                 "Version, damit keine deiner Daten mitgehen.",
+            font=ctk.CTkFont(size=11),
+            text_color=("gray40", "gray60"),
+            wraplength=900, justify="left", anchor="w",
+        ).pack(fill="x", padx=10, pady=(0, 8))
+        ctk.CTkButton(
+            reset_frame,
+            text="🧹 Alle Settings + Logins löschen…",
+            fg_color="#dc2626", hover_color="#b91c1c",
+            height=34,
+            command=self._open_reset_dialog,
+        ).pack(anchor="w", padx=10, pady=(0, 10))
+
+    def _build_settings_window_content(self, parent) -> None:
+        """Baut Trim, Dateiname-Schema, Notifications und Extras in `parent`
+        (das Einstellungs-Fenster). War früher Teil des Advanced-Tabs."""
         # Section / Trim
         sec_frame = ctk.CTkFrame(parent)
         sec_frame.pack(fill="x", padx=10, pady=(10, 5))
@@ -1222,14 +1436,17 @@ class YtDlpGUI(ctk.CTk):
         self.trim_to_entry.grid(row=1, column=3, padx=5, pady=4, sticky="w")
         self._tr(self.trim_to_entry, "trim.placeholder_to",
                  "placeholder_text")
+        # Hinweis: Trim gilt nur pro Video und wird nach dem Download geleert
+        self.trim_hint_lbl = ctk.CTkLabel(
+            sec_frame, text="", text_color=("#b36b00", "#e8a13a"),
+            font=ctk.CTkFont(size=11),
+        )
+        self.trim_hint_lbl.grid(row=2, column=0, columnspan=4,
+                                  padx=10, pady=(0, 8), sticky="w")
+        self._tr(self.trim_hint_lbl, "trim.hint")
 
-        # ─── Datei-Schema ((Author) Simple-Mode UI) ───
-        # Replaces the raw filename_template entry with friendly toggles.
-        # The old textbox lives on under fn_profi_frame, hidden until the
-        # user clicks "Profi-Modus".
+        # ─── Datei-Schema (Simple-Mode UI) ───
         self._build_filename_section(parent)
-
-        # Notifications
 
         # Notifications
         notify_frame = ctk.CTkFrame(parent)
@@ -1281,30 +1498,67 @@ class YtDlpGUI(ctk.CTk):
         ctk.CTkEntry(extras, textvariable=self.rate_var, width=80).grid(
             row=0, column=3, padx=5, pady=8)
 
-        # ─── Zurücksetzen / Portable-Reset (Author) ───
-        reset_frame = ctk.CTkFrame(parent, border_width=2,
-                                     border_color=("#fca5a5", "#7f1d1d"))
-        reset_frame.pack(fill="x", padx=10, pady=(10, 5))
-        ctk.CTkLabel(
-            reset_frame, text="🧹  Zurücksetzen / Portable-Reset",
-            font=ctk.CTkFont(size=13, weight="bold"),
-        ).pack(anchor="w", padx=10, pady=(8, 2))
-        ctk.CTkLabel(
-            reset_frame,
-            text="Löscht ALLE Settings, URL-Historie, Browser-Logins und "
-                 "Cookies. Verwende das vor dem Weitergeben der portablen "
-                 "Version, damit keine deiner Daten mitgehen.",
-            font=ctk.CTkFont(size=11),
-            text_color=("gray40", "gray60"),
-            wraplength=900, justify="left", anchor="w",
-        ).pack(fill="x", padx=10, pady=(0, 8))
-        ctk.CTkButton(
-            reset_frame,
-            text="🧹 Alle Settings + Logins löschen…",
-            fg_color="#dc2626", hover_color="#b91c1c",
-            height=34,
-            command=self._open_reset_dialog,
-        ).pack(anchor="w", padx=10, pady=(0, 10))
+    def _build_settings_window(self) -> None:
+        """Baut das (anfangs versteckte) Einstellungs-Fenster mit ALLEN
+        Optionen. Einmalig beim Start gebaut; der ⚙-Button zeigt es."""
+        win = ctk.CTkToplevel(self)
+        self._settings_win = win
+        win.title(_i18n.t("settings.title"))
+        win.geometry("680x780")
+        scroll = ctk.CTkScrollableFrame(win)
+        scroll.pack(fill="both", expand=True, padx=4, pady=4)
+
+        # ── Dateiname-Vorlage ──
+        fn_frame = ctk.CTkFrame(scroll)
+        fn_frame.pack(fill="x", padx=10, pady=(10, 5))
+        ctk.CTkLabel(fn_frame, text=_i18n.t("settings.fn_template_label"),
+                     font=ctk.CTkFont(size=13, weight="bold")).pack(
+            anchor="w", padx=12, pady=(10, 2))
+        ctk.CTkLabel(fn_frame, text=_i18n.t("settings.fn_template_hint"),
+                     text_color=("gray40", "gray70"),
+                     font=ctk.CTkFont(size=11), justify="left").pack(
+            anchor="w", padx=12, pady=(0, 6))
+        entry = ctk.CTkEntry(fn_frame, textvariable=self.fn_name_template_var)
+        entry.pack(fill="x", padx=12, pady=(0, 8))
+        self._settings_preview_lbl = ctk.CTkLabel(
+            fn_frame, text="", text_color=("#0a7d28", "#46d46a"),
+            font=ctk.CTkFont(size=12), justify="left")
+        self._settings_preview_lbl.pack(anchor="w", padx=12, pady=(0, 10))
+        entry.bind("<KeyRelease>", lambda e: self._update_settings_preview())
+
+        # ── Zu lange Dateinamen ──
+        ln_frame = ctk.CTkFrame(scroll)
+        ln_frame.pack(fill="x", padx=10, pady=5)
+        ctk.CTkLabel(ln_frame, text=_i18n.t("settings.longname_label"),
+                     font=ctk.CTkFont(size=13, weight="bold")).pack(
+            anchor="w", padx=12, pady=(10, 2))
+        ctk.CTkRadioButton(ln_frame, text=_i18n.t("settings.longname_auto"),
+                           variable=self.long_name_mode_var, value="auto").pack(
+            anchor="w", padx=18, pady=3)
+        ctk.CTkRadioButton(ln_frame, text=_i18n.t("settings.longname_ask"),
+                           variable=self.long_name_mode_var, value="ask").pack(
+            anchor="w", padx=18, pady=(3, 10))
+
+        # ── restliche Einstellungen (Trim, Dateiname-Schema, Notify, Extras) ──
+        self._build_settings_window_content(scroll)
+
+        # ── Schließen ──
+        def _close():
+            self.settings["fn_name_template"] = \
+                self.fn_name_template_var.get().strip() or "{name}"
+            self.settings["long_name_mode"] = self.long_name_mode_var.get()
+            save_settings(self.settings)
+            try:
+                self._refresh_filename_preview()
+            except Exception:
+                pass
+            win.withdraw()
+
+        ctk.CTkButton(scroll, text=_i18n.t("settings.save"), command=_close,
+                      height=36).pack(pady=14)
+        win.protocol("WM_DELETE_WINDOW", _close)
+        self._update_settings_preview()
+        win.withdraw()   # anfangs versteckt; der ⚙-Button zeigt es
 
     def _open_reset_dialog(self) -> None:
         """Open the Portable-Reset confirmation dialog (same as launcher)."""
@@ -1562,6 +1816,43 @@ class YtDlpGUI(ctk.CTk):
             pass
 
     # ────────── Datei-Schema ((Author), Simple Mode) ──────────
+
+    def _open_settings_window(self) -> None:
+        """Zeigt das Einstellungs-Fenster (wird einmalig beim Start gebaut)."""
+        win = getattr(self, "_settings_win", None)
+        alive = False
+        try:
+            alive = win is not None and bool(win.winfo_exists())
+        except Exception:
+            alive = False
+        if not alive:
+            self._build_settings_window()
+            win = self._settings_win
+        try:
+            win.deiconify()
+            win.lift()
+            win.focus_force()
+        except Exception:
+            pass
+
+    def _update_settings_preview(self) -> None:
+        """Live-Preview des Dateinamens mit der aktuellen {name}-Vorlage."""
+        lbl = getattr(self, "_settings_preview_lbl", None)
+        if lbl is None:
+            return
+        try:
+            opts = dict(self.settings)
+            opts["fn_name_template"] = self.fn_name_template_var.get()
+            tpl = build_filename_template(opts, num_urls=1)
+            sample = {"uploader": "TheErsysEnding", "id": "abc123",
+                      "title": "Mein Video Titel", "ext": "mp4",
+                      "extractor": "youtube", "extractor_key": "Youtube",
+                      "upload_date": "20260605", "height": 1080,
+                      "timestamp": 1717574400}
+            shown = render_template_preview(tpl, sample).split("/")[-1]
+            lbl.configure(text=_i18n.t("settings.preview_label").format(name=shown))
+        except Exception as e:
+            lbl.configure(text=f"(Preview: {e})")
 
     def _build_filename_section(self, parent) -> None:
         """Build the friendly filename-options section.
@@ -1859,6 +2150,8 @@ class YtDlpGUI(ctk.CTk):
             "fn_sanitize":         self.fn_sanitize_var.get(),
             # NEU 2026-05-24: ID-Mode Toggle
             "fn_use_id_not_title": self.fn_use_id_var.get(),
+            # NEU 2026-06-05: {name}-Vorlage (separates Einstellungs-Fenster)
+            "fn_name_template":    self.fn_name_template_var.get(),
         }
 
     def _refresh_filename_preview(self) -> None:
@@ -2096,10 +2389,9 @@ class YtDlpGUI(ctk.CTk):
                     "Soll der laufende Browser beendet und ein neuer "
                     "gestartet werden?"):
                     return
-                try:
-                    self._login_proc.kill()
-                except Exception:
-                    pass
+                # SAUBER schliessen (Login wird geflusht!) statt hart killen —
+                # sonst geht ein frischer TikTok/Instagram-Login verloren.
+                self._graceful_stop_login()
                 self._login_proc = None
 
         site = self.cookies_v3_site_var.get().strip().lower() or "youtube"
@@ -2159,6 +2451,45 @@ class YtDlpGUI(ctk.CTk):
             text="Browser geöffnet — log dich ein und schließe das Fenster.",
             text_color=("#7c3aed", "#a78bfa"))
         self._poll_login_proc()
+
+    def _graceful_stop_login(self) -> None:
+        """Schliesst den laufenden Login-Browser SAUBER (die Session wird
+        geflusht), statt ihn hart zu killen. Schreibt ein Stop-Signal, das
+        cookie_browser aufnimmt → storage_state()-Flush + ctx.close(). Nur als
+        Fallback (wenn's haengt) wird hart gekillt.
+
+        Behebt: frischer TikTok/Instagram-Login ging beim Neu-Starten des
+        Browsers verloren, weil .kill() Chrome abrupt beendet hat, bevor die
+        lazy nach Platte geschriebene Session (localStorage/IndexedDB) flushte.
+        """
+        proc = getattr(self, "_login_proc", None)
+        if proc is None:
+            return
+        site = getattr(self, "_login_site", None)
+        try:
+            if site:
+                root = Path(__file__).resolve().parent.parent
+                stop = (root / "data" / "playwright_profiles"
+                        / str(site) / ".close_request")
+                stop.parent.mkdir(parents=True, exist_ok=True)
+                stop.write_text("close", encoding="utf-8")
+        except Exception:
+            pass
+        try:
+            self.cookies_v3_status_lbl.configure(
+                text="Schließe Browser sauber (Login wird gespeichert) …",
+                text_color=("gray50", "gray50"))
+            self.update_idletasks()
+        except Exception:
+            pass
+        # Auf sauberes Ende warten (Flush ~2-4s); Fallback-Kill, falls es haengt.
+        try:
+            proc.wait(timeout=12)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
 
     def _chromium_installed(self) -> bool:
         """True if Playwright's Chromium binary is already downloaded.
@@ -2402,7 +2733,7 @@ class YtDlpGUI(ctk.CTk):
             "audio_only": self.audio_only_var.get(),
             "embed_subs": self.embed_subs_var.get(),
             "write_thumbnail": self.thumbnail_var.get(),
-            "rate_limit_kbps": int(self.rate_var.get() or "0"),
+            "rate_limit_kbps": _safe_int(self.rate_var.get(), 0),
             "trim_from": self.trim_from_var.get().strip(),
             "trim_to": self.trim_to_var.get().strip(),
             "filename_template": self.filename_var.get().strip() or
@@ -2428,6 +2759,9 @@ class YtDlpGUI(ctk.CTk):
             # NEU 2026-05-24: ID-vs-Title Toggle
             "fn_use_id_not_title": self.fn_use_id_var.get(),
             "set_upload_date_as_file_date": self.set_file_date_var.get(),
+            # NEU 2026-06-05: Einstellungs-Fenster-Optionen
+            "fn_name_template":    self.fn_name_template_var.get().strip() or "{name}",
+            "long_name_mode":      self.long_name_mode_var.get(),
         })
         save_settings(self.settings)
 
@@ -2730,10 +3064,21 @@ class YtDlpGUI(ctk.CTk):
             tpl = tpl.replace("%(extractor)s", pretty_escaped)
             tpl = tpl.replace("%(extractor_key)s", pretty_escaped)
 
+        # NEU 2026-06-05: Bei aktivem Trim eigenen Dateinamen (mit Zeitspanne)
+        # → die getrimmte Datei kollidiert NICHT mit dem ungeschnittenen
+        # Original, die skip-Policy ueberspringt sie nicht, Original bleibt.
+        _trim_sfx = trim_filename_suffix(settings.get("trim_from", ""),
+                                          settings.get("trim_to", ""))
+        if _trim_sfx:
+            tpl = _insert_before_ext(tpl, _trim_sfx)
+            self._log_queue.put(("INFO",
+                f"✂ Getrimmte Datei wird separat gespeichert:{_trim_sfx}"))
+
         outtmpl = str(Path(out_dir) / tpl)
 
         # Reset success-tracking pro Download-Lauf
         self._success_files: list[str] = []
+        self._longname_run_choice = None  # ASK-Längen-Dialog: nur 1x pro Lauf fragen
         self._age_restricted_seen = False
         self._bot_detect_seen = False
         self._js_missing_seen = False
@@ -2812,10 +3157,28 @@ class YtDlpGUI(ctk.CTk):
             opts["overwrites"] = True
             opts["nooverwrites"] = False
         elif ow == "number":
-            # yt-dlp's default behaviour without explicit overwrite settings
-            # adds a numbered suffix on conflict via outtmpl modification
+            # yt-dlp kann NICHT automatisch eine Nummer bei Konflikt anhaengen
+            # (kein natives Feature) → Verhalten entspricht "Ueberspringen".
+            # (Echtes Nummerieren passiert nur im TikTok-HD-Pfad.)
             opts["overwrites"] = False
-            opts["nooverwrites"] = False
+            opts["nooverwrites"] = True
+
+        # NEU 2026-06-05: Windows-Dateinamen-Längenlimit. trim_file_name wird
+        # IMMER gesetzt → die Datei kann nie zu lang fuer Windows werden
+        # (yt-dlp kuerzt den Namens-Teil, Endung bleibt). Im ASK-Modus fragt
+        # zusätzlich _match_filter VOR dem Download nach (Ja=kürzen / Nein=skip).
+        _ext = ("mp3" if settings.get("audio_only")
+                else str(settings.get("format", "mp4")))
+        self._name_budget = windows_name_budget(out_dir, _ext)
+        self._longname_mode = str(settings.get("long_name_mode", "auto"))
+        self._longname_outdir = out_dir
+        opts["trim_file_name"] = self._name_budget
+        if self._longname_mode == "auto" and (
+                settings.get("fn_name_template", "{name}") != "{name}"
+                or settings.get("trim_from") or settings.get("trim_to")):
+            self._log_queue.put(("INFO",
+                "ℹ Lange Dateinamen werden automatisch auf das Windows-Limit "
+                "gekürzt (Endung bleibt erhalten)."))
         # NEU 2026-05-17: Multi-Language Titel — YouTube hat seit 2024
         # localized titles fuer manche Videos (manche grosse Kanaele).
         # extractor_args["youtube"]["lang"] zwingt yt-dlp einen bestimmten
@@ -2858,8 +3221,11 @@ class YtDlpGUI(ctk.CTk):
             }]
         elif container in ("mp4", "webm", "mkv"):
             opts["merge_output_format"] = container
+            # Remux statt Convert: Container per Stream-Copy aendern (kein
+            # Re-Encode) → schneller + verlustfrei. Vorher wurde IMMER neu
+            # kodiert, auch wenn der Container schon passte.
             opts["postprocessors"] = [{
-                "key": "FFmpegVideoConvertor",
+                "key": "FFmpegVideoRemuxer",
                 "preferedformat": container,
             }]
         if FFMPEG_PATH and Path(FFMPEG_PATH).exists():
@@ -2955,7 +3321,9 @@ class YtDlpGUI(ctk.CTk):
                             opts_retry["progress_hooks"] = opts["progress_hooks"]
                             try:
                                 with yt_dlp.YoutubeDL(opts_retry) as ydl_retry:
+                                    self._current_ydl = ydl_retry  # Cancel greift auch im Retry
                                     ydl_retry.download([url])
+                                self._current_ydl = ydl
                                 if (len(self._success_files) - before_count) > 0:
                                     self._log_queue.put(("INFO",
                                         f"✅ Auto-Retry mit {browser}-Cookies "
@@ -2965,6 +3333,7 @@ class YtDlpGUI(ctk.CTk):
                                 if self._bot_detect_seen:
                                     cookies_loaded_but_blocked = True
                             except Exception as e:
+                                self._current_ydl = ydl
                                 msg = str(e).lower()
                                 if "could not copy" in msg or "locked" in msg:
                                     self._log_queue.put(("INFO",
@@ -3076,7 +3445,44 @@ class YtDlpGUI(ctk.CTk):
         """
         if self._stop_requested:
             return "Abbruch durch Nutzer"
+        # NEU 2026-06-05: ASK-Modus — vor dem Download nachfragen, wenn der
+        # Dateiname das Windows-Limit reissen würde. Defensiv: bei JEDEM Problem
+        # einfach weiterladen (trim_file_name kuerzt ohnehin sicher).
+        try:
+            if (not incomplete
+                    and getattr(self, "_longname_mode", "auto") == "ask"
+                    and self._current_ydl is not None):
+                name = self._prepared_basename(info_dict)
+                stem = os.path.splitext(name)[0] if name else ""
+                budget = getattr(self, "_name_budget", 0)
+                if stem and budget and len(stem) >= budget:
+                    # nur EINMAL pro Lauf fragen — sonst friert eine Playlist die
+                    # GUI pro Item mit einem modalen Dialog ein
+                    choice = getattr(self, "_longname_run_choice", None)
+                    if choice is None:
+                        choice = self._ask_longname_blocking(name)
+                        self._longname_run_choice = choice
+                    if choice == "abbrechen":
+                        return "Übersprungen — Dateiname zu lang"
+        except Exception:
+            pass
         return None
+
+    def _prepared_basename(self, info_dict) -> str:
+        """Echter Ziel-Dateiname (Basename) via yt-dlp prepare_filename."""
+        try:
+            return os.path.basename(self._current_ydl.prepare_filename(info_dict))
+        except Exception:
+            return ""
+
+    def _ask_longname_blocking(self, name: str) -> str:
+        """Thread-sicher fragen (Main-Thread zeigt den Dialog). Ja=kürzen,
+        Nein=abbrechen. Default 'kuerzen' bei Timeout — haengt NIE."""
+        self._longname_choice = "kuerzen"
+        self._longname_event = threading.Event()
+        self._log_queue.put(("LONGNAME_ASK", name))
+        self._longname_event.wait(timeout=90)
+        return self._longname_choice
 
     def _post_hook(self, filepath: str) -> None:
         """Wird NACH jedem fertigen Datei-Download aufgerufen.
@@ -3183,6 +3589,8 @@ class YtDlpGUI(ctk.CTk):
                     self.dl_btn.configure(state="normal",
                                             text=_i18n.t("btn.download"))
                     self.cancel_btn.configure(state="disabled")
+                    # Trim ist pro Video -> nach jedem Download leeren
+                    self._reset_trim_fields()
                 elif kind == "URL_STATUS":
                     url, status = payload
                     self._set_url_status(url, status)
@@ -3194,11 +3602,38 @@ class YtDlpGUI(ctk.CTk):
                     )
                 elif kind == "TOAST_ERROR":
                     self._send_toast("toast.title.error", "toast.body.error")
+                elif kind == "LONGNAME_ASK":
+                    try:
+                        nm = str(payload)
+                        short = nm if len(nm) <= 70 else nm[:67] + "…"
+                        yes = messagebox.askyesno(
+                            _i18n.t("longname.ask_title"),
+                            _i18n.t("longname.ask_body").format(
+                                name=short, limit=WIN_MAX_FILENAME))
+                        self._longname_choice = "kuerzen" if yes else "abbrechen"
+                    except Exception:
+                        self._longname_choice = "kuerzen"
+                    finally:
+                        try:
+                            self._longname_event.set()
+                        except Exception:
+                            pass
                 else:  # INFO / ERROR
                     self._log(payload)
         except queue.Empty:
             pass
         self.after(100, self._poll_log_queue)
+
+    def _reset_trim_fields(self) -> None:
+        """Leert die Section/Trim-Eingabe — sie gilt nur fuer EINEN Download
+        und soll nach jedem Download (und nach Neustart) verschwinden."""
+        try:
+            self.trim_from_var.set("")
+            self.trim_to_var.set("")
+        except Exception:
+            pass
+        self.settings["trim_from"] = ""
+        self.settings["trim_to"] = ""
 
     def _log(self, msg: str) -> None:
         timestamp = time.strftime("%H:%M:%S")

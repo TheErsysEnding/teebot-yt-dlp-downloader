@@ -152,6 +152,13 @@ def set_file_date_from_id(file_path: Path, item_id: str,
             import ctypes
             from ctypes import wintypes
             kernel32 = ctypes.windll.kernel32
+            # restype/argtypes setzen — sonst schneidet ctypes das 64-Bit-HANDLE
+            # auf 32 Bit ab → SetFileTime bekommt ein kaputtes Handle + Leak.
+            kernel32.CreateFileW.restype = wintypes.HANDLE
+            kernel32.CreateFileW.argtypes = [
+                wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+            ]
             # FILETIME = 100-ns intervals since 1601-01-01 UTC
             # unix epoch is 1970-01-01; offset = 116444736000000000 (100-ns units)
             ft_int = int((ts * 1e7) + 116444736000000000)
@@ -164,7 +171,8 @@ def set_file_date_from_id(file_path: Path, item_id: str,
                 0x02000000,             # FILE_FLAG_BACKUP_SEMANTICS (works on dirs too)
                 None,
             )
-            if h != -1:
+            _invalid = (1 << (ctypes.sizeof(ctypes.c_void_p) * 8)) - 1  # INVALID_HANDLE_VALUE
+            if h and h != _invalid:
                 try:
                     kernel32.SetFileTime(h, ctypes.byref(ft),
                                           ctypes.byref(ft),
@@ -339,7 +347,7 @@ def _tiktok_id_to_date(item_id: str) -> str:
 
 def _enumerate_via_ytdlp(
     url: str, max_items: int, log_cb: Callable[[str], None],
-    cookies_file: Optional[Path] = None,
+    cookies_file: Optional[Path] = None, need_dates: bool = False,
 ) -> list[dict]:
     """Use yt-dlp --flat-playlist to list channel items.
 
@@ -401,6 +409,39 @@ def _enumerate_via_ytdlp(
         # even with playlistend, so we have to enforce client-side.
         if max_items > 0 and len(out) >= max_items:
             break
+
+    # NEU 2026-06-05: Flat-Playlist (v.a. YouTube) liefert KEIN upload_date →
+    # bei aktivem Datumsfilter wuerden sonst ALLE Items ohne Datum verworfen
+    # (= 0 Ergebnisse). Darum hier das Datum pro Item nachladen.
+    if need_dates:
+        missing = [it for it in out if not it.get("upload_date")]
+        cap = 400
+        if missing:
+            if len(missing) > cap:
+                log_cb(f"Datumsfilter: lade Datum nur fuer die ersten {cap} von "
+                       f"{len(missing)} Items (Limit) — ggf. max_items setzen")
+                missing = missing[:cap]
+            else:
+                log_cb(f"Datumsfilter: lade Upload-Datum fuer {len(missing)} "
+                       f"Items nach …")
+            try:
+                d_opts = {"quiet": True, "no_warnings": True,
+                          "skip_download": True, "extract_flat": False}
+                if cookies_file and Path(cookies_file).exists():
+                    d_opts["cookiefile"] = str(cookies_file)
+                with yt_dlp.YoutubeDL(d_opts) as dydl:
+                    for i, it in enumerate(missing, 1):
+                        try:
+                            vi = dydl.extract_info(
+                                it.get("url") or it.get("id"),
+                                download=False, process=False)
+                            it["upload_date"] = (vi or {}).get("upload_date") or ""
+                        except Exception:
+                            pass
+                        if i % 25 == 0:
+                            log_cb(f"  … {i}/{len(missing)} Daten geladen")
+            except Exception as e:
+                log_cb(f"Datums-Nachladen fehlgeschlagen: {e}")
     return out
 
 
@@ -530,15 +571,17 @@ def enumerate_channel(
     has_date_filter = bool(options.date_from or options.date_to)
 
     if plat in ("youtube", "tiktok"):
-        # TikTok IDs have timestamps in upper 32 bits → no extra API for dates
-        # YouTube extract_flat returns upload_date directly
-        # For date-filter, we may need to enumerate MORE items than max_items
-        # because filter will drop some — heuristic: x10 if filter active
+        # TikTok-IDs tragen den Timestamp in den oberen Bits → Datum gratis.
+        # YouTube-Flat-Playlist hat KEIN upload_date → bei Datumsfilter laedt
+        # _enumerate_via_ytdlp(need_dates=True) das Datum pro Item nach.
+        # Bei Filter mehr Items aufzaehlen (manche fallen raus): x10.
         enum_cap = options.max_items
         if has_date_filter and enum_cap > 0:
             enum_cap = enum_cap * 10  # buffer
         items = _enumerate_via_ytdlp(url, enum_cap, log_cb,
-                                      options.cookies_file)
+                                      options.cookies_file,
+                                      need_dates=(has_date_filter
+                                                  and plat != "tiktok"))
     else:
         # Instagram, Twitter, Facebook → gallery-dl (has upload_date in meta)
         items = _enumerate_via_gallerydl(url, options.max_items, log_cb,
@@ -625,26 +668,27 @@ def _download_item_tiktok_photo(
     item_url: str, out_dir: Path, uploader: str, item_id: str,
     options: ChannelOptions, log_cb: Callable[[str], None],
     progress_cb: Optional[Callable] = None,
-) -> int:
+) -> tuple[int, int]:
     """TikTok photo carousel → tikwm.com.
 
-    Returns number of images written (could be 1-10 per post).
+    Returns (written, skipped_existing) — z.B. (3, 0) neu, (0, 5) alles da.
     """
     try:
         data = _tikwm_get(item_url)
     except Exception as e:
         log_cb(f"tikwm fetch failed: {e}")
-        return 0
+        return 0, 0
     images = data.get("images") or []
     if not images:
         # Maybe the URL is a video that tikwm returned as video data
         play = data.get("play") or data.get("hdplay")
         if play:
             log_cb(f"tikwm returned video for photo URL: {item_url}")
-            return 0
-        return 0
+            return 0, 0
+        return 0, 0
     out_dir.mkdir(parents=True, exist_ok=True)
     written = 0
+    skipped = 0
     for i, img_url in enumerate(images, 1):
         # ext from URL or default jpg
         ext = "jpg"
@@ -663,7 +707,7 @@ def _download_item_tiktok_photo(
         out_path = out_dir / fname
         if out_path.exists() and not options.overwrite:
             log_cb(f"skip existing: {fname}")
-            written += 1
+            skipped += 1
             continue
         try:
             _download_image(img_url, out_path, progress_cb)
@@ -671,7 +715,7 @@ def _download_item_tiktok_photo(
             log_cb(f"wrote photo: {fname}")
         except Exception as e:
             log_cb(f"photo download failed ({fname}): {e}")
-    return written
+    return written, skipped
 
 
 def _download_item_via_ytdlp(
@@ -728,8 +772,10 @@ def _download_item_via_ytdlp(
         }]
     elif container in ("mp4", "webm", "mkv"):
         opts["merge_output_format"] = container
+        # Remux statt Convert: Container per Stream-Copy aendern (kein
+        # Re-Encode) → schneller + verlustfrei. Vorher wurde IMMER neu kodiert.
         opts["postprocessors"] = [{
-            "key": "FFmpegVideoConvertor",
+            "key": "FFmpegVideoRemuxer",
             "preferedformat": container,
         }]
     if options.cookies_file and Path(options.cookies_file).exists():
@@ -836,13 +882,14 @@ def download_channel(
         try:
             if detect_platform(item_url) == "tiktok":
                 if kind == "picture":
-                    n = _download_item_tiktok_photo(
+                    written, skipped = _download_item_tiktok_photo(
                         item_url, sub, user, item_id, options, log_cb,
                     )
-                    stats.downloaded_picture += n
-                    if n == 0:
+                    stats.downloaded_picture += written
+                    stats.skipped_existing += skipped
+                    if written == 0 and skipped == 0:
                         stats.failed += 1
-                    elif options.set_upload_date_as_file_date:
+                    elif written > 0 and options.set_upload_date_as_file_date:
                         # Stamp every photo file in this batch
                         for ph in sub.glob(f"*{item_id}*"):
                             set_file_date_from_id(ph, item_id, upload_date)
@@ -853,7 +900,11 @@ def download_channel(
                         title=title,
                     )
                     out_path = sub / fname
-                    if out_path.exists() and not options.overwrite:
+                    _stem = out_path.stem
+                    if (not options.overwrite and sub.exists() and any(
+                            p.is_file() and p.name.startswith(_stem + ".")
+                            for p in sub.iterdir())):
+                        # beliebige Endung (.mp4/.mp3) zaehlt als vorhanden
                         log_cb(f"skip existing: {fname}")
                         stats.skipped_existing += 1
                         continue
@@ -874,6 +925,15 @@ def download_channel(
                 )
                 # yt-dlp picks its own ext; pass without extension
                 out_path = sub / Path(fname_base).with_suffix("")
+                _stem = out_path.name
+                if (not options.overwrite and sub.exists() and any(
+                        p.is_file() and p.name.startswith(_stem + ".")
+                        for p in sub.iterdir())):
+                    # bereits vorhanden -> als skipped zaehlen (vorher wurde es
+                    # faelschlich als "downloaded" gezaehlt)
+                    log_cb(f"skip existing: {_stem}")
+                    stats.skipped_existing += 1
+                    continue
                 ok = _download_item_via_ytdlp(
                     item_url, out_path, options, log_cb,
                 )

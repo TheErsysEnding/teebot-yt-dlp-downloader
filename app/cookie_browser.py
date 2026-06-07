@@ -169,8 +169,12 @@ def cookies_to_netscape(cookies: Iterable[dict]) -> str:
         # Skip blank cookies (malformed)
         if not name:
             continue
+        # yt-dlp/curl markieren HttpOnly-Cookies mit dem Zeilen-Prefix
+        # "#HttpOnly_" vor der Domain — sonst geht das Flag beim Re-Export
+        # verloren bzw. manche Parser verwerfen die Zeile.
+        dom_field = ("#HttpOnly_" + domain) if c.get("httpOnly") else domain
         out.append(
-            f"{domain}\t{include_subdomains}\t{path}\t{secure}\t"
+            f"{dom_field}\t{include_subdomains}\t{path}\t{secure}\t"
             f"{exp_int}\t{name}\t{value}"
         )
     return "\n".join(out) + "\n"
@@ -238,6 +242,16 @@ def run_login(url: str, out_path: Path, site: str) -> int:
 
     profile_dir = PROFILES_DIR / site
     profile_dir.mkdir(parents=True, exist_ok=True)
+    # Externes "sauber schliessen"-Signal vom GUI (graceful restart). Liegt
+    # diese Datei vor, brechen wir die Warteschleife ab und flushen sauber —
+    # statt vom Eltern-Prozess hart gekillt zu werden. Ohne das geht ein
+    # frischer Login in localStorage/IndexedDB verloren (TikTok/Instagram!).
+    stop_file = profile_dir / ".close_request"
+    try:
+        if stop_file.exists():
+            stop_file.unlink()
+    except Exception:
+        pass
 
     # Prefer site-specific login URL if user just passed the homepage
     eff_url = _site_specific_url(site, url) if url == "homepage" else url
@@ -371,6 +385,16 @@ def run_login(url: str, out_path: Path, site: str) -> int:
         try:
             while not closed[0] and time.time() < deadline:
                 time.sleep(0.4)
+                # Externes Schliess-Signal vom GUI? -> graceful beenden (der
+                # Flush-Code unten schreibt dann Cookies/localStorage auf Platte)
+                try:
+                    if stop_file.exists():
+                        stop_file.unlink()
+                        print("[cookie_browser] stop-request -> graceful close")
+                        closed[0] = True
+                        break
+                except Exception:
+                    pass
                 # Heartbeat every 2s: snapshot cookies + verify browser alive
                 if time.time() - last_heartbeat > 2.0:
                     last_heartbeat = time.time()
